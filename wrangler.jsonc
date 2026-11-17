@@ -1,7 +1,7 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "rone-arena-api",
-  "account_id": "340d242720cb1c4dd22d5d43d67685db",
+  "account_id": "164f26b4a618b7d341864e5a7a4c484b",
   "main": "src/worker.py",
   "compatibility_date": "2026-09-25",
   "compatibility_flags": ["python_workers"],
