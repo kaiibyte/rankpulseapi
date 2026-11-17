@@ -10,9 +10,8 @@ from pydantic import BaseModel, Field
 from app.api.dependencies import require_api_available
 from app.core.config import SECRET_KEY, _raw_env
 from app.core.exceptions import AppError
-from app.core.http import UpstreamHeaderBuilder, _get_client
+from app.core.http import _get_client
 from app.core.security import CryptoManager
-from app.services.user import fetch_user_post
 
 
 router = APIRouter(
@@ -22,6 +21,8 @@ router = APIRouter(
 )
 
 bearer = HTTPBearer(auto_error=False)
+
+RONE_API = "https://arena.rone.dev/api"
 
 
 class MLBBAccountInput(BaseModel):
@@ -103,6 +104,60 @@ def _authenticate(
 RankPulseUser = Annotated[str, Depends(_authenticate)]
 
 
+def _rone_request(
+    method: str,
+    endpoint: str,
+    *,
+    payload: dict[str, Any] | None = None,
+    jwt: str | None = None,
+) -> dict[str, Any]:
+    headers = {
+        "Accept": "application/json",
+    }
+
+    if jwt:
+        headers["Authorization"] = f"Bearer {jwt}"
+
+    try:
+        response = _get_client().request(
+            method,
+            f"{RONE_API}{endpoint}",
+            headers=headers,
+            json=payload,
+        )
+    except Exception as exc:
+        raise AppError(
+            status_code=502,
+            code="RONE_API_UNAVAILABLE",
+            message="Could not contact the Rone Arena API.",
+        ) from exc
+
+    if response.status_code != 200:
+        raise AppError(
+            status_code=502,
+            code="RONE_API_ERROR",
+            message="The Rone Arena API returned an error.",
+        )
+
+    try:
+        result = response.json()
+    except ValueError as exc:
+        raise AppError(
+            status_code=502,
+            code="INVALID_RONE_RESPONSE",
+            message="Rone Arena returned invalid JSON.",
+        ) from exc
+
+    if not isinstance(result, dict):
+        raise AppError(
+            status_code=502,
+            code="INVALID_RONE_RESPONSE",
+            message="Rone Arena returned an invalid response.",
+        )
+
+    return result
+
+
 def _db_request(
     method: str,
     table: str,
@@ -115,6 +170,7 @@ def _db_request(
 
     headers = {
         "apikey": key,
+        "Authorization": f"Bearer {key}",
         "Content-Type": "application/json",
     }
 
@@ -212,16 +268,16 @@ def send_mlbb_code(
     body: MLBBAccountInput,
     user_id: RankPulseUser,
 ):
-    result = fetch_user_post(
-        "base/sendVc",
-        UpstreamHeaderBuilder.get_user_header(),
-        {
-            "roleId": body.role_id,
-            "zoneId": body.zone_id,
+    result = _rone_request(
+        "POST",
+        "/user/auth/send-vc",
+        payload={
+            "role_id": body.role_id,
+            "zone_id": body.zone_id,
         },
     )
 
-    if not isinstance(result, dict) or str(result.get("code")) != "0":
+    if str(result.get("code")) != "0":
         raise AppError(
             status_code=400,
             code="VERIFICATION_CODE_FAILED",
@@ -248,19 +304,17 @@ def verify_mlbb_account(
             message="The verification code must contain numbers only.",
         )
 
-    login_result = fetch_user_post(
-        "base/login",
-        UpstreamHeaderBuilder.get_user_header(),
-        {
-            "roleId": body.role_id,
-            "zoneId": body.zone_id,
+    login_result = _rone_request(
+        "POST",
+        "/user/auth/login",
+        payload={
+            "role_id": body.role_id,
+            "zone_id": body.zone_id,
             "vc": verification_code,
-            "referer": "academy",
-            "type": "web",
         },
     )
 
-    if not isinstance(login_result, dict) or str(login_result.get("code")) != "0":
+    if str(login_result.get("code")) != "0":
         raise AppError(
             status_code=400,
             code="MLBB_LOGIN_FAILED",
@@ -285,18 +339,13 @@ def verify_mlbb_account(
             message="MLBB did not return an account session.",
         )
 
-    info_result = fetch_user_post(
-        "base/getBaseInfo",
-        UpstreamHeaderBuilder.get_user_header(
-            lang="en",
-            x_actid="2728785",
-            x_appid="2713644",
-            jwt=jwt,
-        ),
-        {},
+    info_result = _rone_request(
+        "GET",
+        "/user/info",
+        jwt=jwt,
     )
 
-    if not isinstance(info_result, dict) or str(info_result.get("code")) != "0":
+    if str(info_result.get("code")) != "0":
         raise AppError(
             status_code=400,
             code="MLBB_PROFILE_FAILED",
@@ -316,7 +365,10 @@ def verify_mlbb_account(
     actual_zone = info.get("zoneId", login_data.get("zoneid"))
 
     try:
-        if int(actual_role) != body.role_id or int(actual_zone) != body.zone_id:
+        if (
+            int(actual_role) != body.role_id
+            or int(actual_zone) != body.zone_id
+        ):
             raise AppError(
                 status_code=400,
                 code="ACCOUNT_MISMATCH",
@@ -366,9 +418,15 @@ def get_linked_mlbb_account(user_id: RankPulseUser):
     ).json()
 
     if not result:
-        return {"linked": False, "account": None}
+        return {
+            "linked": False,
+            "account": None,
+        }
 
-    return {"linked": True, "account": result[0]}
+    return {
+        "linked": True,
+        "account": result[0],
+    }
 
 
 @router.delete("/mlbb/disconnect")
