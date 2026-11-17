@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 from copy import deepcopy
@@ -14,20 +15,28 @@ from app.core.cache_headers import PublicCacheHeaders
 from app.core.config import DEBUG, IS_AVAILABLE, PROJECT_VERSION
 from app.core.images import wsrv_json
 from app.core.paths import PUBLIC_DIR
-
 from app.api.dependencies import service_unavailable_error
+
 from app.api.routers.root import router as root_router
 from app.api.routers.heroes import router as heroes_router
 from app.api.routers.academy import router as academy_router
 from app.api.routers.addon import router as addon_router
 from app.api.routers.esports import router as esports_router
 from app.api.routers.user import router as user_router
+from app.api.routers.rankpulse import router as rankpulse_router
+
 from app.web.routers.llms import router as llms_router
 from app.web.routers.root import router as web_router
 from app.web.negotiation import MarkdownNegotiation
 from app.web.routers.blog import router as blog_router
 
-from app.core.errors import AppError, app_error_handler, safe_error_payload, unhandled_error_handler
+from app.core.errors import (
+    AppError,
+    app_error_handler,
+    safe_error_payload,
+    unhandled_error_handler,
+)
+
 
 app = FastAPI(
     debug=DEBUG,
@@ -82,20 +91,23 @@ app = FastAPI(
             "name": "esports",
             "description": "Professional league schedules, playoffs, standings, and match details.",
         },
-    ]
+    ],
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allows all domains, including http://localhost:3000
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"],  # Allows all HTTP methods (GET, POST, OPTIONS, etc.)
-    allow_headers=["*"],  # Allows all headers
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
-# Web pages answer `Accept: text/markdown` with their markdown twin and link it in a header.
+
+# Web pages answer Accept: text/markdown with their markdown twin.
 app.add_middleware(MarkdownNegotiation)
-# Public hero, academy and esports answers may be kept by browsers and shared caches for 5 minutes.
+
+# Public API answers may be cached for 5 minutes.
 app.add_middleware(PublicCacheHeaders)
+
 
 def _inline_enum_defaults_in_parameters(schema: dict[str, object]) -> None:
     components = schema.get("components", {})
@@ -132,6 +144,7 @@ def _inline_enum_defaults_in_parameters(schema: dict[str, object]) -> None:
 
                 ref = param_schema.get("$ref")
                 has_default = "default" in param_schema
+
                 if not isinstance(ref, str) or not has_default:
                     continue
 
@@ -141,6 +154,7 @@ def _inline_enum_defaults_in_parameters(schema: dict[str, object]) -> None:
 
                 component_name = ref[len(prefix):]
                 component_schema = component_schemas.get(component_name, {})
+
                 if not isinstance(component_schema, dict) or "enum" not in component_schema:
                     continue
 
@@ -161,17 +175,21 @@ def _resolve_schema_ref(
     component_schemas: dict[str, object],
 ) -> dict[str, object]:
     ref = schema.get("$ref")
+
     if not isinstance(ref, str):
         return schema
 
     prefix = "#/components/schemas/"
+
     if not ref.startswith(prefix):
         return schema
 
     component_name = ref[len(prefix):]
     target = component_schemas.get(component_name, {})
+
     if isinstance(target, dict):
         return target
+
     return schema
 
 
@@ -184,18 +202,26 @@ def _order_example_by_schema(
 
     if isinstance(example_data, dict):
         properties = resolved.get("properties", {})
+
         if isinstance(properties, dict) and properties:
             ordered: dict[str, object] = {}
 
             for key, child_schema in properties.items():
                 if key not in example_data:
                     continue
+
                 child = child_schema if isinstance(child_schema, dict) else {}
-                ordered[key] = _order_example_by_schema(example_data[key], child, component_schemas)
+
+                ordered[key] = _order_example_by_schema(
+                    example_data[key],
+                    child,
+                    component_schemas,
+                )
 
             for key, value in example_data.items():
                 if key in ordered:
                     continue
+
                 ordered[key] = value
 
             return ordered
@@ -208,6 +234,7 @@ def _order_example_by_schema(
     if isinstance(example_data, list):
         item_schema = resolved.get("items", {})
         item_schema_dict = item_schema if isinstance(item_schema, dict) else {}
+
         return [
             _order_example_by_schema(item, item_schema_dict, component_schemas)
             for item in example_data
@@ -218,10 +245,12 @@ def _order_example_by_schema(
 
 def _normalize_component_schema_examples(schema: dict[str, object]) -> None:
     components = schema.get("components", {})
+
     if not isinstance(components, dict):
         return
 
     component_schemas = components.get("schemas", {})
+
     if not isinstance(component_schemas, dict):
         return
 
@@ -258,9 +287,10 @@ def custom_openapi() -> dict[str, object]:
 
     _inline_enum_defaults_in_parameters(openapi_schema)
     _normalize_component_schema_examples(openapi_schema)
-    # Examples hold literal upstream image URLs; show them as the API now returns them.
+
     schema = wsrv_json(openapi_schema)
     app.openapi_schema = schema
+
     return schema
 
 
@@ -268,67 +298,116 @@ app.openapi = custom_openapi
 
 
 class ServiceStatusGuard:
-    """While the service is restricted, keep only the status page, blog and assets up.
+    """Keep only status pages and assets available during service restrictions."""
 
-    A plain ASGI middleware rather than @app.middleware("http"), which wraps every
-    request in a task group; this one only runs when the service is restricted.
-    """
-
-    _ALLOWED_PREFIXES = ("/blog", "/images", "/favicon.ico", "/static", "/robots.txt", "/sitemap.xml", "/llms.txt", "/llms-full.txt", "/index.md")
+    _ALLOWED_PREFIXES = (
+        "/blog",
+        "/images",
+        "/favicon.ico",
+        "/static",
+        "/robots.txt",
+        "/sitemap.xml",
+        "/llms.txt",
+        "/llms-full.txt",
+        "/index.md",
+    )
 
     def __init__(self, app: ASGIApp) -> None:
         self.app = app
 
-    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+    async def __call__(
+        self,
+        scope: Scope,
+        receive: Receive,
+        send: Send,
+    ) -> None:
         path = scope.get("path", "")
-        if scope["type"] != "http" or path == "/" or path.startswith(self._ALLOWED_PREFIXES):
+
+        if (
+            scope["type"] != "http"
+            or path == "/"
+            or path.startswith(self._ALLOWED_PREFIXES)
+        ):
             await self.app(scope, receive, send)
             return
 
         if path.startswith("/api"):
-            response = await app_error_handler(Request(scope), service_unavailable_error())
+            response = await app_error_handler(
+                Request(scope),
+                service_unavailable_error(),
+            )
         else:
             response = RedirectResponse(url="/", status_code=307)
+
         await response(scope, receive, send)
 
 
 if not IS_AVAILABLE:
     app.add_middleware(ServiceStatusGuard)
 
-# api routers
+
+# API routers
 app.include_router(root_router)
 app.include_router(heroes_router)
 app.include_router(academy_router)
 app.include_router(user_router)
+app.include_router(rankpulse_router)
 app.include_router(addon_router)
 app.include_router(esports_router)
 
-# web routes; the markdown twins (`/x.md`) go first so `/web/{group}/{path}` does not catch them
+
+# Web routes
 app.include_router(llms_router)
 app.include_router(web_router)
 app.include_router(blog_router)
 
-# static assets: blog images and the web UI stylesheet and scripts, which stay
-# reachable during maintenance so the status page renders styled. On Cloudflare
-# Workers `public/` is served as Static Assets before the app, so PUBLIC_DIR is None.
+
+# Static assets
 if PUBLIC_DIR is not None:
-    app.mount("/images", StaticFiles(directory=str(PUBLIC_DIR / "images")), name="images")
-    app.mount("/static", StaticFiles(directory=str(PUBLIC_DIR / "static")), name="static")
+    app.mount(
+        "/images",
+        StaticFiles(directory=str(PUBLIC_DIR / "images")),
+        name="images",
+    )
+    app.mount(
+        "/static",
+        StaticFiles(directory=str(PUBLIC_DIR / "static")),
+        name="static",
+    )
 
 
-# exception handlers
-app.add_exception_handler(AppError, app_error_handler)  # type: ignore[arg-type]
-app.add_exception_handler(Exception, unhandled_error_handler)  # type: ignore[arg-type]
+# Exception handlers
+app.add_exception_handler(
+    AppError,
+    app_error_handler,
+)  # type: ignore[arg-type]
+
+app.add_exception_handler(
+    Exception,
+    unhandled_error_handler,
+)  # type: ignore[arg-type]
 
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(_, exc: HTTPException) -> JSONResponse:
     payload = safe_error_payload(str(exc.detail), exc.status_code)
-    return JSONResponse(status_code=exc.status_code, content=payload)
+
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=payload,
+    )
 
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(_, exc: RequestValidationError) -> JSONResponse:
-    payload = safe_error_payload("Validation failed.", 422, exc.errors())
+    payload = safe_error_payload(
+        "Validation failed.",
+        422,
+        exc.errors(),
+    )
     payload["code"] = "VALIDATION_ERROR"
-    return JSONResponse(status_code=422, content=payload)
+
+    return JSONResponse(
+        status_code=422,
+        content=payload,
+    )
